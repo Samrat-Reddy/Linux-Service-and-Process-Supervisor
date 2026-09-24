@@ -52,6 +52,7 @@ struct service {
     int    failures;             /* consecutive failed restarts        */
     int    gave_up;              /* too many failures, stop trying     */
     time_t restart_at;           /* 0 = nothing scheduled              */
+    int    paused;               /* suspended with SIGSTOP             */
 };
 
 static struct service services[MAX_SERVICES];
@@ -190,6 +191,7 @@ static void start_service(struct service *s)
     s->pid             = pid;               /* parent */
     s->stopped_by_user = 0;
     s->restart_at      = 0;
+    s->paused          = 0;
     logmsg("[%s] started, pid %d", s->name, (int)pid);
 }
 
@@ -317,7 +319,7 @@ static void show_status(void)
         if (s->pid > 0) {
             read_proc_info(s->pid, &procstate, &rss);
             snprintf(pidbuf, sizeof pidbuf, "%d", (int)s->pid);
-            state = "running";
+            state = s->paused ? "paused" : "running";
         } else if (s->gave_up) {
             state = "failed";
         } else if (s->restart_at != 0) {
@@ -344,6 +346,12 @@ static void menu_stop(const char *name)
         }
         s->stopped_by_user = 1;
         s->restart_at      = 0;
+        /* A stopped process cannot act on SIGTERM until it is scheduled
+         * again, so wake it first. */
+        if (s->paused) {
+            kill(s->pid, SIGCONT);
+            s->paused = 0;
+        }
         kill(s->pid, SIGTERM);              /* ask it to terminate */
         logmsg("[%s] sent SIGTERM to pid %d", s->name, (int)s->pid);
         return;
@@ -369,6 +377,51 @@ static void menu_start(const char *name)
     printf("  no service named '%s'\n", name);
 }
 
+/*
+ * SIGSTOP cannot be caught or ignored by the target process: the kernel
+ * removes it from the run queue directly. SIGCONT makes it runnable again.
+ * This is the same mechanism the shell uses for job control with Ctrl-Z.
+ */
+static void menu_pause(const char *name)
+{
+    for (int i = 0; i < service_count; i++) {
+        struct service *s = &services[i];
+        if (strcmp(s->name, name) != 0)
+            continue;
+        if (s->pid < 0) {
+            printf("  %s is not running\n", name);
+            return;
+        }
+        if (s->paused) {
+            printf("  %s is already paused\n", name);
+            return;
+        }
+        kill(s->pid, SIGSTOP);              /* suspend it */
+        s->paused = 1;
+        logmsg("[%s] suspended with SIGSTOP (pid %d)", s->name, (int)s->pid);
+        return;
+    }
+    printf("  no service named '%s'\n", name);
+}
+
+static void menu_resume(const char *name)
+{
+    for (int i = 0; i < service_count; i++) {
+        struct service *s = &services[i];
+        if (strcmp(s->name, name) != 0)
+            continue;
+        if (s->pid < 0 || !s->paused) {
+            printf("  %s is not paused\n", name);
+            return;
+        }
+        kill(s->pid, SIGCONT);              /* let it run again */
+        s->paused = 0;
+        logmsg("[%s] resumed with SIGCONT (pid %d)", s->name, (int)s->pid);
+        return;
+    }
+    printf("  no service named '%s'\n", name);
+}
+
 static void handle_command(char *line)
 {
     char *cmd, *arg, *save;
@@ -385,10 +438,14 @@ static void handle_command(char *line)
         menu_stop(arg);
     else if (strcmp(cmd, "start") == 0 && arg != NULL)
         menu_start(arg);
+    else if (strcmp(cmd, "pause") == 0 && arg != NULL)
+        menu_pause(arg);
+    else if (strcmp(cmd, "resume") == 0 && arg != NULL)
+        menu_resume(arg);
     else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0)
         raise(SIGTERM);
     else
-        printf("  commands: status | start <name> | stop <name> | quit\n");
+        printf("  commands: status | start <name> | stop <name> | pause <name> | resume <name> | quit\n");
 }
 
 /* ---------------------------------------------------------------- signals */
@@ -465,7 +522,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < service_count; i++)
         start_service(&services[i]);
 
-    printf("\n  commands: status | start <name> | stop <name> | quit\n\n");
+    printf("\n  commands: status | start <name> | stop <name> | pause <name> | resume <name> | quit\n\n");
 
     while (!quitting) {
         /* Wait up to one second for a typed command. The timeout also paces
